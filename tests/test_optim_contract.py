@@ -305,3 +305,34 @@ def test_step_updates_parameters_through_internal_sgd(
 
     torch.testing.assert_close(model.block_a.weight, before_a - 0.1)
     torch.testing.assert_close(model.block_b.weight, before_b - 0.1)
+
+
+@pytest.mark.parametrize("reshape_mode", ["in_dim", "out_dim", "ker_dim", "flatten"])
+@pytest.mark.parametrize("shape", [(3, 5), (2, 3, 2, 2)])
+def test_cuda_subspace_matches_cpu(model, block_info, alpha_provider, reshape_mode, shape):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is unavailable")
+    pytest.importorskip("cupy")
+    optimizer = build_optimizer(model, block_info, alpha_provider, reshape_mode=reshape_mode)
+    generator = torch.Generator().manual_seed(42)
+    cpu_snapshots, gpu_snapshots = deque(), deque()
+    for _ in range(3):
+        weight = torch.randn(shape, generator=generator, dtype=torch.float64)
+        cpu = optimizer._create_subspace(nn.Parameter(weight))
+        gpu = optimizer._create_subspace(nn.Parameter(weight.cuda()))
+        assert gpu.is_cuda
+        torch.testing.assert_close(cpu @ cpu.T, (gpu @ gpu.T).cpu(), atol=1e-8, rtol=1e-8)
+        cpu_snapshots.append(cpu)
+        gpu_snapshots.append(gpu)
+    assert optimizer._measure_acceleration(gpu_snapshots) == pytest.approx(
+        optimizer._measure_acceleration(cpu_snapshots), abs=1e-7
+    )
+
+
+def test_cpu_snapshot_is_independent(model, block_info, alpha_provider):
+    optimizer = build_optimizer(model, block_info, alpha_provider, reshape_mode="flatten")
+    snapshot = optimizer._create_subspace(model.block_a.weight)
+    original = snapshot.clone()
+    with torch.no_grad():
+        model.block_a.weight.zero_()
+    torch.testing.assert_close(snapshot, original)

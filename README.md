@@ -168,9 +168,62 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10)
 
 ## CPU와 CUDA
 
-모델은 CPU 또는 CUDA device에서 학습할 수 있습니다. 다만 subspace snapshot은 대표 weight를 CPU `float64` Tensor로 복사한 뒤 SVD로 계산하므로, 큰 모델에서는 GPU에서 CPU로의 전송과 CPU SVD가 병목이 될 수 있습니다.
+CUDA 모델의 subspace snapshot, SVD, 투영과 magnitude 계산은 CuPy로 GPU에서 수행합니다. PyTorch와 CuPy는 DLPack으로 GPU 메모리를 공유하며, snapshot은 별도로 복사해 이후 weight 갱신의 영향을 받지 않습니다. 행렬 전체를 CPU로 전송하지 않지만 rank 판정과 학습률 계산에 필요한 scalar는 CPU로 가져옵니다. snapshot은 모델과 같은 GPU의 float64 Tensor로 보관됩니다.
 
-현재 구현은 CuPy를 사용하거나 요구하지 않습니다.
+CPU 모델은 기존 PyTorch CPU 경로를 사용하며 CuPy가 필요하지 않습니다. CUDA 모델에 CuPy가 없으면 설치 안내와 함께 오류가 발생합니다. 모델을 GPU로 옮기는 것은 사용자가 `model.to("cuda")`로 수행해야 하며, snapshot 수집 후에는 모델 device를 변경하지 마세요.
+
+### 실행 시 CuPy 자동 선택
+
+CUDA용 PyTorch와 CuPy를 설치해도 모델과 입력이 자동으로 GPU로 이동하지는 않습니다. 사용자가 모델을 CUDA device로 옮긴 뒤 optimizer를 생성하고, 학습에 사용하는 입력과 target도 같은 device로 옮겨야 합니다.
+
+```python
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = block_info.build_model(num_classes=10).to(device)
+optimizer = SeperationOptimizer(
+    model, block_info, alpha_provider, base_lr=0.01
+)
+
+for epoch in range(100):
+    optimizer.step_lr(epoch)
+    model.train()
+    for inputs, targets in trainloader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(inputs), targets)
+        loss.backward()
+        optimizer.step()
+```
+
+모듈은 부분공간을 계산할 대표 파라미터의 device를 확인합니다. 파라미터가 CUDA에 있으면 별도 옵션 없이 CuPy를 사용하고, CPU에 있으면 PyTorch CPU 연산을 사용합니다. 입력 데이터의 device는 이 선택의 기준이 아닙니다. 모델의 forward/backward와 SGD 갱신은 PyTorch가 수행하고, CuPy는 부분공간 행렬 연산을 수행합니다.
+
+### GPU 환경 설치
+
+**`pip install .` 또는 `pip install -e .`는 `scripts/install.py`를 자동 실행하지 않습니다.** GPU 감지와 그에 따른 의존성 설치를 사용하려면 저장소에서 `python scripts/install.py`를 직접 실행하세요. 이 스크립트는 PyTorch와 필요한 CuPy를 설치한 다음 현재 패키지를 개발 모드로 설치합니다.
+
+`pyproject.toml` 의존성은 하드웨어를 감지하거나 PyTorch wheel 저장소를 지정할 수 없습니다. 다음 스크립트는 `nvidia-smi`로 GPU 접근 가능 여부를 확인해 GPU용 PyTorch와 CuPy 또는 CPU용 PyTorch를 설치합니다. **현재 Python 환경의 PyTorch를 재설치하므로 전용 가상환경에서 실행하세요.**
+
+```bash
+# 먼저 실제 실행할 명령 확인
+python scripts/install.py --dry-run
+# GPU 감지 시 CUDA 12.6 PyTorch와 cupy-cuda12x 설치
+python scripts/install.py
+# 드라이버와 GPU에 맞는 버전을 명시
+python scripts/install.py --device cuda --cuda 12.8
+# CPU 환경 강제 선택
+python scripts/install.py --device cpu
+```
+
+지원 선택지는 CUDA 12.6, 12.8, 13.0입니다. 자동 감지는 드라이버 호환 버전이나 GPU 아키텍처까지 판정하지 않으므로 [PyTorch 설치 안내](https://pytorch.org/get-started/locally/)에서 환경에 맞는 버전을 확인해 `--cuda`로 지정하세요. 드라이버 접근이 불가능하면 auto 모드는 CPU를 선택합니다.
+
+수동 설치 예시(CUDA 12.6):
+
+```bash
+python -m pip install --upgrade --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+python -m pip install -e ".[cuda12]"
+```
+
+CUDA 13 계열에는 `[cuda13]` extra를 사용합니다. 서로 다른 CuPy 배포판을 함께 설치하지 마세요. 자세한 CUDA 요구사항은 [CuPy 설치 안내](https://docs.cupy.dev/en/stable/install.html)를 참고하세요.
 
 ## 테스트
 

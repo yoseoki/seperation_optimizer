@@ -13,6 +13,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cuda12 = ["cupy-cuda12x>=13"]
+cuda13 = ["cupy-cuda13x>=14"]
 test = [
     "pytest>=8",
 ]

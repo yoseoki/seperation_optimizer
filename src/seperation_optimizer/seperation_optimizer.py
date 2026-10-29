@@ -181,7 +181,9 @@ class SeperationOptimizer:
         return left_vectors[:, :rank].contiguous()
 
     def _create_subspace(self, parameter):
-        """대표 weight를 CPU 행렬로 변환해 직교 부분공간을 생성한다. 입력은 Parameter이고 출력은 CPU의 2차원 Tensor이다. 반환값은 epoch 시점의 대표 레이어 weight 열 공간을 의미한다."""
+        """대표 weight와 같은 device에서 직교 부분공간을 생성한다. CUDA에서는 CuPy를 사용하며 출력은 2차원 Tensor이다. 반환값은 epoch 시점의 대표 레이어 weight 열 공간을 의미한다."""
+        if parameter.is_cuda:
+            return self._create_cuda_subspace(parameter)
         weight = parameter.detach().to(device="cpu", dtype=torch.float64).clone()
 
         if self.reshape_mode == "flatten" or weight.ndim < 2:
@@ -213,6 +215,84 @@ class SeperationOptimizer:
             raise RuntimeError("subspace calculation produced NaN or Inf")
         return basis
 
+    @staticmethod
+    def _cupy():
+        """CUDA 경로에서만 선택적 CuPy 의존성을 불러온다."""
+        try:
+            import cupy
+        except ImportError as error:
+            raise RuntimeError(
+                "CUDA subspace calculations require CuPy. Install the cuda12 or "
+                "cuda13 extra matching your PyTorch CUDA build; see README.md."
+            ) from error
+        return cupy
+
+    def _cupy_orthonormalize(self, matrix, cp):
+        """GPU 행렬의 유효 열 공간을 CuPy SVD로 계산한다."""
+        if not bool(cp.isfinite(matrix).all().item()):
+            raise RuntimeError("representative weight contains NaN or Inf")
+        if matrix.size == 0:
+            return cp.zeros((matrix.shape[0], 1), dtype=matrix.dtype)
+        with cp.errstate(linalg="raise"):
+            left, values, _ = cp.linalg.svd(matrix, full_matrices=False)
+        largest = values.max().item() if values.size else 0.0
+        if largest <= self._EPSILON:
+            return cp.zeros((matrix.shape[0], 1), dtype=matrix.dtype)
+        rank = int((values > self._EPSILON * max(matrix.shape) * largest).sum().item())
+        if rank == 0:
+            return cp.zeros((matrix.shape[0], 1), dtype=matrix.dtype)
+        return cp.ascontiguousarray(left[:, :rank])
+
+    def _create_cuda_subspace(self, parameter):
+        """DLPack으로 GPU weight를 공유하고 독립적인 CuPy snapshot을 생성한다."""
+        cp = self._cupy()
+        with cp.cuda.Device(parameter.device.index):
+            weight = cp.from_dlpack(parameter.detach().to(dtype=torch.float64)).copy()
+            if not bool(cp.isfinite(weight).all().item()):
+                raise RuntimeError("representative weight contains NaN or Inf")
+            if self.reshape_mode == "flatten" or weight.ndim < 2:
+                vector = weight.reshape(-1, 1)
+                norm = cp.linalg.norm(vector).item()
+                basis = cp.zeros_like(vector) if norm <= self._EPSILON else vector / norm
+            else:
+                if weight.ndim == 4:
+                    out_channels, in_channels, height, width = weight.shape
+                    kernel_size = height * width
+                    if self.reshape_mode == "in_dim":
+                        data = weight.swapaxes(0, 1).reshape(in_channels, -1).T
+                    elif self.reshape_mode == "out_dim":
+                        data = weight.reshape(out_channels, -1).T
+                    else:
+                        data = weight.reshape(out_channels * in_channels, kernel_size).T
+                else:
+                    data = weight.reshape(weight.shape[0], math.prod(weight.shape[1:]))
+                    if data.shape[1] >= data.shape[0]:
+                        data = data.T
+                basis = self._cupy_orthonormalize(data, cp)
+            if not bool(cp.isfinite(basis).all().item()):
+                raise RuntimeError("subspace calculation produced NaN or Inf")
+            return torch.from_dlpack(basis)
+
+    def _measure_cuda_acceleration(self, snapshots):
+        """snapshot의 투영, SVD, 가속도 계산을 GPU에서 수행한다."""
+        cp = self._cupy()
+        with cp.cuda.Device(snapshots[0].device.index):
+            previous, current, following = [cp.from_dlpack(basis) for basis in snapshots]
+            if cp.linalg.norm(current).item() <= self._EPSILON:
+                return 0.0
+            span = self._cupy_orthonormalize(cp.concatenate((previous, following), axis=1), cp)
+            if cp.linalg.norm(span).item() <= self._EPSILON:
+                return 0.0
+            projected = self._cupy_orthonormalize(span @ (span.T @ current), cp)
+            if cp.linalg.norm(projected).item() <= self._EPSILON:
+                return float(2 * current.shape[1])
+            with cp.errstate(linalg="raise"):
+                values = cp.linalg.svd(projected.T @ current, compute_uv=False)
+            magnitude = 2.0 * (current.shape[1] - cp.clip(values, 0.0, 1.0).sum().item())
+            if not math.isfinite(magnitude):
+                raise RuntimeError("acceleration magnitude calculation produced NaN or Inf")
+            return max(0.0, magnitude)
+
     def _require_three_snapshots(self):
         """모든 대표 레이어에 최근 snapshot 세 개가 있는지 검증한다. 입력은 없고 출력은 None이다. RuntimeError는 기준값이나 magnitude 계산에 필요한 이력이 부족함을 의미한다."""
         missing_names = [name for name in self._names if len(self._buffer[name]) < 3]
@@ -227,6 +307,10 @@ class SeperationOptimizer:
         basis_previous, basis_current, basis_next = snapshots
         if basis_previous.shape[0] != basis_current.shape[0] or basis_current.shape[0] != basis_next.shape[0]:
             raise RuntimeError("subspace dimensions must remain constant across snapshots")
+        if any(basis.device != basis_current.device for basis in snapshots):
+            raise RuntimeError("snapshot devices must remain constant")
+        if basis_current.is_cuda:
+            return self._measure_cuda_acceleration(snapshots)
         if torch.linalg.vector_norm(basis_current).item() <= self._EPSILON:
             return 0.0
 
